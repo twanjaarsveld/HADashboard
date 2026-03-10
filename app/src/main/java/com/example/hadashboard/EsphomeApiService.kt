@@ -1,6 +1,9 @@
 package com.example.hadashboard
 
 import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -10,12 +13,15 @@ import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Environment
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.StatFs
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import com.example.esphomeproto.api.*
 import java.io.InputStream
 import java.io.OutputStream
@@ -33,6 +39,9 @@ class EsphomeApiService : Service() {
     // Internal Media Player for actual playback
     private var internalMediaPlayer: MediaPlayer? = null
 
+    private val CHANNEL_ID = "HADashboardServiceChannel"
+    private val NOTIFICATION_ID = 1
+
     // Entity Keys
     private val SCREEN_KEY = 101
     private val LIGHT_KEY = 200
@@ -47,6 +56,20 @@ class EsphomeApiService : Service() {
     private val MEDIA_PLAYER_KEY = 300
 
     data class SocketOutputStreamPair(val socket: Socket, val output: OutputStream)
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val serviceChannel = NotificationChannel(
+                CHANNEL_ID,
+                "HADashboard Background Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Maintains connection to Home Assistant"
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(serviceChannel)
+        }
+    }
 
     private fun getAppVersion(): String {
         return try {
@@ -63,6 +86,19 @@ class EsphomeApiService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        createNotificationChannel()
+
+        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("HADashboard Active")
+            .setContentText("Maintaining ESPHome connection...")
+            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+
+        // Critical: Start as foreground service to prevent sleep killing
+        startForeground(NOTIFICATION_ID, notification)
+
         isRunning = true
         startServer()
         startUpdateTimer()
@@ -72,6 +108,7 @@ class EsphomeApiService : Service() {
     private fun startServer() {
         thread {
             try {
+                serverSocket?.close() // Ensure any old socket is dead
                 serverSocket = ServerSocket(6053)
                 while (isRunning) {
                     val client = serverSocket?.accept()
@@ -126,7 +163,6 @@ class EsphomeApiService : Service() {
                             sendFrame(output, 10, resp.toByteArray())
                         }
                         11 -> { // ListEntitiesRequest
-                            // Switches
                             sendFrame(output, 17, ListEntitiesSwitchResponse.newBuilder()
                                 .setObjectId("tablet_screen").setKey(SCREEN_KEY).setName("Screen").build().toByteArray())
 
@@ -134,12 +170,10 @@ class EsphomeApiService : Service() {
                                 .setObjectId("kiosk_mode").setKey(KIOSK_KEY).setName("Kiosk Mode")
                                 .setIcon("mdi:lock").build().toByteArray())
 
-                            // Light (Backlight)
                             sendFrame(output, 15, ListEntitiesLightResponse.newBuilder()
                                 .setObjectId("tablet_backlight").setKey(LIGHT_KEY).setName("Backlight")
                                 .addSupportedColorModes(ColorMode.COLOR_MODE_BRIGHTNESS).build().toByteArray())
 
-                            // Sensors
                             sendFrame(output, 16, ListEntitiesSensorResponse.newBuilder()
                                 .setObjectId("tablet_battery").setKey(BATT_KEY).setName("Battery")
                                 .setUnitOfMeasurement("%").setDeviceClass("battery")
@@ -160,7 +194,6 @@ class EsphomeApiService : Service() {
                                 .setUnitOfMeasurement("min").setIcon("mdi:timer-outline")
                                 .setAccuracyDecimals(0).build().toByteArray())
 
-                            // Buttons
                             sendFrame(output, 61, ListEntitiesButtonResponse.newBuilder()
                                 .setObjectId("tablet_reload").setKey(RELOAD_KEY).setName("Reload Dashboard")
                                 .setIcon("mdi:refresh").build().toByteArray())
@@ -173,13 +206,12 @@ class EsphomeApiService : Service() {
                                 .setObjectId("tablet_zoom_out").setKey(ZOOM_OUT_KEY).setName("Zoom Out")
                                 .setIcon("mdi:magnify-minus").build().toByteArray())
 
-                            // Media Player (Dynamic Name)
                             sendFrame(output, 63, ListEntitiesMediaPlayerResponse.newBuilder()
                                 .setObjectId("tablet_media")
                                 .setKey(MEDIA_PLAYER_KEY)
                                 .setName("$deviceName Speaker")
                                 .setSupportsPause(true)
-                                .setFeatureFlags(1 + 2 + 4 + 8) // Play, Pause, Stop, Vol
+                                .setFeatureFlags(1 + 2 + 4 + 8)
                                 .build().toByteArray())
 
                             sendFrame(output, 19, ListEntitiesDoneResponse.newBuilder().build().toByteArray())
@@ -221,13 +253,9 @@ class EsphomeApiService : Service() {
                         65 -> { // MediaPlayerCommandRequest
                             val cmd = MediaPlayerCommandRequest.parseFrom(payload)
                             if (cmd.key == MEDIA_PLAYER_KEY) {
-
-                                // 1. HANDLE URL PLAYBACK (TTS / Streams)
                                 if (cmd.hasMediaUrl && cmd.mediaUrl.isNotEmpty()) {
                                     playMediaUrl(cmd.mediaUrl)
                                 }
-
-                                // 2. HANDLE TRANSPORT COMMANDS
                                 if (cmd.hasCommand) {
                                     when (cmd.command) {
                                         MediaPlayerCommand.MEDIA_PLAYER_COMMAND_PLAY -> internalMediaPlayer?.start()
@@ -239,15 +267,11 @@ class EsphomeApiService : Service() {
                                         else -> {}
                                     }
                                 }
-
-                                // 3. HANDLE VOLUME (Direct System Control)
                                 if (cmd.hasVolume) {
                                     val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                                     val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                                     am.setStreamVolume(AudioManager.STREAM_MUSIC, (maxVol * cmd.volume).toInt(), 0)
                                 }
-
-                                // Send feedback state immediately
                                 sendMediaState(output)
                             }
                         }
@@ -265,6 +289,7 @@ class EsphomeApiService : Service() {
         try {
             internalMediaPlayer?.stop()
             internalMediaPlayer?.release()
+            internalMediaPlayer = null
 
             internalMediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
@@ -273,14 +298,16 @@ class EsphomeApiService : Service() {
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .build()
                 )
+                setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
                 setDataSource(applicationContext, Uri.parse(url))
                 prepareAsync()
-                setOnPreparedListener { start() }
-                setOnCompletionListener {
-                    it.reset()
-                    // Optional: Send state update when finished
+                setOnPreparedListener { it.start() }
+                setOnCompletionListener { it.reset() }
+                setOnErrorListener { mp, what, extra ->
+                    Log.e("ESPHomeAPI", "MediaPlayer Error: $what, $extra")
+                    mp.reset()
+                    true
                 }
-                setOnErrorListener { _, _, _ -> true }
             }
         } catch (e: Exception) {
             Log.e("ESPHomeAPI", "Playback error: ${e.message}")
@@ -332,9 +359,7 @@ class EsphomeApiService : Service() {
             val uptimeMinutes = (SystemClock.elapsedRealtime().toFloat() / 60000f)
             sendFrame(output, 25, SensorStateResponse.newBuilder().setKey(UPTIME_KEY).setState(round(uptimeMinutes)).build().toByteArray())
 
-            // Media Player State (ID 64)
             sendMediaState(output)
-
         } catch (e: Exception) { }
     }
 
@@ -392,6 +417,7 @@ class EsphomeApiService : Service() {
         isRunning = false
         internalMediaPlayer?.release()
         serverSocket?.close()
+        stopForeground(true) // Clean up the notification
         super.onDestroy()
     }
 

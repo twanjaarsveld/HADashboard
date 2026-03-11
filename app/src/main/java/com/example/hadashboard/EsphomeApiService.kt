@@ -35,8 +35,6 @@ class EsphomeApiService : Service() {
     private var serverSocket: ServerSocket? = null
     private var isRunning = true
     private val activeClients = Collections.synchronizedList(mutableListOf<SocketOutputStreamPair>())
-
-    // Internal Media Player for actual playback
     private var internalMediaPlayer: MediaPlayer? = null
 
     private val CHANNEL_ID = "HADashboardServiceChannel"
@@ -81,8 +79,18 @@ class EsphomeApiService : Service() {
     }
 
     private fun getUniqueMac(): String {
-        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "00000000"
-        return androidId.chunked(2).take(6).joinToString(":").uppercase()
+        val prefs = getSharedPreferences("HADashboardPrefs", Context.MODE_PRIVATE)
+        var savedMac = prefs.getString("fixed_mac", null)
+
+        if (savedMac == null) {
+            val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "00000000"
+            // Salt with package name to prevent conflicts with other apps on the same device
+            val salt = packageName
+            val combined = (androidId + salt).hashCode().toString().replace("-", "")
+            savedMac = combined.padEnd(12, '0').chunked(2).take(6).joinToString(":").uppercase()
+            prefs.edit().putString("fixed_mac", savedMac).apply()
+        }
+        return savedMac!!
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -96,7 +104,6 @@ class EsphomeApiService : Service() {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
 
-        // Critical: Start as foreground service to prevent sleep killing
         startForeground(NOTIFICATION_ID, notification)
 
         isRunning = true
@@ -108,7 +115,7 @@ class EsphomeApiService : Service() {
     private fun startServer() {
         thread {
             try {
-                serverSocket?.close() // Ensure any old socket is dead
+                serverSocket?.close()
                 serverSocket = ServerSocket(6053)
                 while (isRunning) {
                     val client = serverSocket?.accept()
@@ -226,6 +233,7 @@ class EsphomeApiService : Service() {
                                 val action = if (cmd.state) "SCREEN_ON" else "SCREEN_OFF"
                                 sendBroadcast(Intent("DASHBOARD_COMMAND").putExtra("action", action))
                             }
+                            // Confirm state back immediately
                             sendFrame(output, 26, SwitchStateResponse.newBuilder().setKey(cmd.key).setState(cmd.state).build().toByteArray())
                         }
                         32 -> { // LightCommandRequest
@@ -333,10 +341,18 @@ class EsphomeApiService : Service() {
 
     private fun sendAllStates(output: OutputStream) {
         try {
-            sendFrame(output, 26, SwitchStateResponse.newBuilder().setKey(SCREEN_KEY).setState(true).build().toByteArray())
+            // Fix: Check actual hardware screen state
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val isScreenOn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+                pm.isInteractive
+            } else {
+                @Suppress("DEPRECATION")
+                pm.isScreenOn
+            }
+            sendFrame(output, 26, SwitchStateResponse.newBuilder().setKey(SCREEN_KEY).setState(isScreenOn).build().toByteArray())
 
             val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            val isKioskActive = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            val isKioskActive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 am.lockTaskModeState != ActivityManager.LOCK_TASK_MODE_NONE
             } else false
             sendFrame(output, 26, SwitchStateResponse.newBuilder().setKey(KIOSK_KEY).setState(isKioskActive).build().toByteArray())
@@ -417,7 +433,12 @@ class EsphomeApiService : Service() {
         isRunning = false
         internalMediaPlayer?.release()
         serverSocket?.close()
-        stopForeground(true) // Clean up the notification
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
         super.onDestroy()
     }
 
